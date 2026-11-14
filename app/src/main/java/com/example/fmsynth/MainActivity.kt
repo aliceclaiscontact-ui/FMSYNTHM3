@@ -104,6 +104,7 @@ class MainActivity : ComponentActivity() {
         applyOrientation(orientState.intValue)
         Store.read(this, "auto")?.let { Store.engineFromJson(engine, it) }
         engine.start()
+        recoverRecordings(applicationContext)
         var recFile: File? = null
         setContent {
             AppTheme(themeState.intValue) {
@@ -122,7 +123,7 @@ class MainActivity : ComponentActivity() {
                     },
                     onRec = { on ->
                         if (on) {
-                            val f = File(cacheDir, "rec_${System.currentTimeMillis()}.pcm")
+                            val f = File(filesDir, "rec_${System.currentTimeMillis()}.pcm")
                             recFile = f
                             engine.startRecording(f)
                         } else {
@@ -279,7 +280,7 @@ fun Transport(
     onRec: (Boolean) -> Unit,
     onSettings: () -> Unit
 ) {
-    var playing by remember { mutableStateOf(engine.playing) }
+    var playing by remember(projVer) { mutableStateOf(engine.playing) }
     var bpm by remember(projVer) { mutableFloatStateOf(engine.bpm) }
     var rec by remember { mutableStateOf(engine.recording) }
     var sec by remember { mutableIntStateOf(0) }
@@ -879,6 +880,7 @@ fun FilesPage(engine: FmEngine, ti: Int, onLoaded: () -> Unit) {
     val t = engine.tracks[ti]
     fun toast(s: String) = Toast.makeText(ctx, s, Toast.LENGTH_SHORT).show()
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        NewProjectCard(engine, onLoaded)
         FxCard("Проекты", "Всё сразу: паттерны, звуки, эффекты и темп всех дорожек. Последнее состояние сохраняется само") {
             val tag = ver
             for (n in 1..8) {

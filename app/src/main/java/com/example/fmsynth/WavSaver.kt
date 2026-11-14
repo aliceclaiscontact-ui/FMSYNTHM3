@@ -11,7 +11,11 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 object WavSaver {
-    private fun header(dataLen: Long, sr: Int, ch: Int, bits: Int): ByteArray {
+    private const val CH = 2
+    private const val SRATE = 44100
+    private const val BITS = 16
+
+    private fun header(dataLen: Long): ByteArray {
         val bb = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN)
         bb.put("RIFF".toByteArray())
         bb.putInt((36 + dataLen).toInt())
@@ -19,24 +23,25 @@ object WavSaver {
         bb.put("fmt ".toByteArray())
         bb.putInt(16)
         bb.putShort(1)
-        bb.putShort(ch.toShort())
-        bb.putInt(sr)
-        bb.putInt(sr * ch * bits / 8)
-        bb.putShort((ch * bits / 8).toShort())
-        bb.putShort(bits.toShort())
+        bb.putShort(CH.toShort())
+        bb.putInt(SRATE)
+        bb.putInt(SRATE * CH * BITS / 8)
+        bb.putShort((CH * BITS / 8).toShort())
+        bb.putShort(BITS.toShort())
         bb.put("data".toByteArray())
         bb.putInt(dataLen.toInt())
         return bb.array()
     }
 
     private fun write(out: OutputStream, pcm: File) {
-        out.write(header(pcm.length(), 44100, 2, 16))
+        val len = pcm.length() - pcm.length() % 4
+        out.write(header(len))
         pcm.inputStream().use { it.copyTo(out) }
     }
 
     fun save(ctx: Context, pcm: File, name: String): String? {
         return try {
-            if (pcm.length() < 2L) return null
+            if (pcm.length() < 4L) return null
             if (Build.VERSION.SDK_INT >= 29) {
                 val cv = ContentValues().apply {
                     put(MediaStore.Audio.Media.DISPLAY_NAME, name)
