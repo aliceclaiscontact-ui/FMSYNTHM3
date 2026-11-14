@@ -4,12 +4,20 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
 import android.os.Process
+import java.io.BufferedOutputStream
+import java.io.File
+import java.io.FileOutputStream
+import java.util.concurrent.LinkedBlockingQueue
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.exp
+import kotlin.math.floor
 import kotlin.math.min
 import kotlin.math.pow
+import kotlin.math.round
+import kotlin.math.sign
 import kotlin.math.sin
+import kotlin.math.tanh
 
 const val STEPS = 16
 const val NTRACKS = 6
@@ -27,6 +35,7 @@ class FmTrack {
     @Volatile var drive = 0f
     @Volatile var vol = 0.8f
     @Volatile var mute = false
+    @Volatile var solo = false
     val notes = IntArray(STEPS) { -1 }
     @Volatile var pending = -1
 
@@ -65,6 +74,25 @@ private class AllPass(n: Int) {
     }
 }
 
+private fun readFrac(b: FloatArray, w: Int, d: Float): Float {
+    val n = b.size
+    val dd = d.coerceIn(1f, n - 2f)
+    val pos = w - dd
+    val i0f = floor(pos)
+    val fr = pos - i0f
+    var i0 = i0f.toInt() % n
+    if (i0 < 0) i0 += n
+    val i1 = if (i0 + 1 >= n) 0 else i0 + 1
+    return b[i0] * (1f - fr) + b[i1] * fr
+}
+
+private fun softClip(x: Float): Float = x / (1f + abs(x))
+
+private fun limit(x: Float): Float {
+    val a = abs(x)
+    return if (a < 0.8f) x else sign(x) * (0.8f + 0.2f * tanh((a - 0.8f) / 0.2f))
+}
+
 class FmEngine {
     val tracks = List(NTRACKS) { FmTrack() }
 
@@ -72,19 +100,40 @@ class FmEngine {
     @Volatile var playing = false
     @Volatile var step = -1
 
+    // delay (время от 1 мс)
     @Volatile var delayMs = 300f
     @Volatile var delayFb = 0.35f
+    @Volatile var delayTone = 0.6f
     @Volatile var delayMix = 0.2f
+    // flanger / chorus
+    @Volatile var flRate = 0.4f
+    @Volatile var flDepth = 3f
+    @Volatile var flBase = 2f
+    @Volatile var flFb = 0.3f
+    @Volatile var flMix = 0f
+    // bitcrusher
+    @Volatile var crBits = 8f
+    @Volatile var crRate = 4f
+    @Volatile var crMix = 0f
+    // ring mod
+    @Volatile var rmFreq = 200f
+    @Volatile var rmMix = 0f
+    // reverb
     @Volatile var revSize = 0.7f
     @Volatile var revDamp = 0.4f
     @Volatile var revMix = 0.2f
     @Volatile var master = 0.8f
 
+    // запись
+    @Volatile var recording = false
+    @Volatile var recSamples = 0L
+    private val recQueue = LinkedBlockingQueue<ByteArray>()
+    private var recThread: Thread? = null
+
     @Volatile private var running = false
     private var thread: Thread? = null
 
     init {
-        // бас
         listOf(0 to 36, 3 to 36, 6 to 39, 8 to 36, 11 to 43, 14 to 41)
             .forEach { (s, n) -> tracks[0].notes[s] = n }
         tracks[0].apply {
@@ -92,7 +141,6 @@ class FmEngine {
             ratio[0] = 1f; ratio[1] = 1f; ratio[2] = 2f; ratio[3] = 1f
             level[0] = 0.9f; level[1] = 0.5f; level[2] = 0.3f; level[3] = 0.2f
         }
-        // лид
         listOf(2 to 60, 6 to 63, 10 to 67, 14 to 65)
             .forEach { (s, n) -> tracks[1].notes[s] = n }
         tracks[1].apply {
@@ -100,7 +148,6 @@ class FmEngine {
             ratio[0] = 1f; ratio[1] = 2f; ratio[2] = 1f; ratio[3] = 3f
             level[0] = 0.8f; level[1] = 0.5f; level[2] = 0.6f; level[3] = 0.35f
         }
-        // металл/хэт
         for (s in 0 until STEPS step 2) tracks[2].notes[s] = 90
         tracks[2].apply {
             algo = 0; fb = 1f; ampDec = 0.06f; modDec = 0.05f; cutoff = 1f; vol = 0.5f
@@ -161,6 +208,34 @@ class FmEngine {
         return out
     }
 
+    fun startRecording(file: File) {
+        if (recording) return
+        recQueue.clear()
+        recSamples = 0L
+        val out = BufferedOutputStream(FileOutputStream(file), 1 shl 16)
+        recThread = Thread {
+            try {
+                while (true) {
+                    val b = recQueue.take()
+                    if (b.isEmpty()) break
+                    out.write(b)
+                }
+            } catch (e: Exception) {
+            } finally {
+                try { out.close() } catch (e: Exception) {}
+            }
+        }.also { it.start() }
+        recording = true
+    }
+
+    fun stopRecording() {
+        if (!recording) return
+        recording = false
+        recQueue.put(ByteArray(0))
+        recThread?.join()
+        recThread = null
+    }
+
     fun start() {
         if (running) return
         running = true
@@ -193,11 +268,20 @@ class FmEngine {
             val buf = ShortArray(frames)
             val dl = FloatArray(SR * 2)
             var dw = 0
+            var dCur = -1f
+            var dLp = 0f
+            val fl = FloatArray(4096)
+            var flW = 0
+            var flPh = 0.0
+            var rmPh = 0.0
+            var crCnt = 0f
+            var crHold = 0f
             val combs = arrayOf(Comb(1116), Comb(1188), Comb(1277), Comb(1356))
             val aps = arrayOf(AllPass(556), AllPass(441))
             val lpC = FloatArray(NTRACKS)
             val ampC = FloatArray(NTRACKS)
             val modC = FloatArray(NTRACKS)
+            val audible = BooleanArray(NTRACKS)
             var counter = 0.0
             var was = false
 
@@ -208,17 +292,34 @@ class FmEngine {
                 if (!isPlaying && was) step = -1
                 was = isPlaying
 
+                var anySolo = false
+                for (k in 0 until NTRACKS) if (tracks[k].solo) anySolo = true
+
                 for (k in 0 until NTRACKS) {
                     val t = tracks[k]
+                    audible[k] = !t.mute && (!anySolo || t.solo)
                     lpC[k] = (1.0 - exp(-TWO_PI * 40.0 * 500.0.pow(t.cutoff.toDouble()) / SR)).toFloat()
                     ampC[k] = exp(-1.0 / (SR * t.ampDec.toDouble())).toFloat()
                     modC[k] = exp(-1.0 / (SR * t.modDec.toDouble())).toFloat()
                     val pn = t.pending
                     if (pn >= 0) { t.pending = -1; trig(t, pn) }
                 }
-                val dTime = (delayMs / 1000f * SR).toInt().coerceIn(1, dl.size - 1)
-                val dFb = delayFb
+
+                val dTarget = (delayMs * SR / 1000f).coerceIn(1f, (dl.size - 2).toFloat())
+                if (dCur < 0f) dCur = dTarget
+                val dFbV = delayFb
+                val dTone = 0.05f + 0.95f * delayTone
                 val dMix = delayMix
+                val flRateV = flRate
+                val flDepthV = flDepth
+                val flBaseV = flBase
+                val flFbV = flFb
+                val flMixV = flMix
+                val crLevels = 2f.pow(crBits - 1f)
+                val crRateV = crRate
+                val crMixV = crMix
+                val rmFreqV = rmFreq
+                val rmMixV = rmMix
                 val rFb = 0.7f + revSize * 0.28f
                 val rDamp = revDamp
                 val rMix = revMix
@@ -234,7 +335,7 @@ class FmEngine {
                             for (k in 0 until NTRACKS) {
                                 val t = tracks[k]
                                 val n = t.notes[s]
-                                if (n >= 0 && !t.mute) trig(t, n)
+                                if (n >= 0 && audible[k]) trig(t, n)
                             }
                         }
                     }
@@ -243,6 +344,7 @@ class FmEngine {
                     for (k in 0 until NTRACKS) {
                         val t = tracks[k]
                         if (t.amp < 0.0003f) continue
+                        if (!audible[k]) { t.amp = 0f; continue }
                         if (t.atk < 1f) t.atk = min(1f, t.atk + 0.02f)
                         var y = voice(t) * t.amp * t.atk
                         t.amp *= ampC[k]
@@ -258,22 +360,66 @@ class FmEngine {
                         mix += y * t.vol * 0.3f
                     }
 
-                    val rp = (dw - dTime + dl.size) % dl.size
-                    val dOut = dl[rp]
-                    dl[dw] = mix + dOut * dFb
-                    dw = (dw + 1) % dl.size
-                    var x = mix + dOut * dMix
+                    var x = mix
 
+                    // ring mod
+                    if (rmMixV > 0.001f) {
+                        rmPh += TWO_PI * rmFreqV / SR
+                        if (rmPh > TWO_PI) rmPh -= TWO_PI
+                        x = x * (1f - rmMixV) + x * sin(rmPh).toFloat() * rmMixV
+                    }
+
+                    // bitcrusher
+                    if (crMixV > 0.001f) {
+                        crCnt += 1f
+                        if (crCnt >= crRateV) {
+                            crCnt -= crRateV
+                            crHold = round(x * crLevels) / crLevels
+                        }
+                        x = x * (1f - crMixV) + crHold * crMixV
+                    }
+
+                    // flanger / chorus
+                    if (flMixV > 0.001f) {
+                        flPh += flRateV.toDouble() / SR
+                        if (flPh >= 1.0) flPh -= 1.0
+                        val lfo = 0.5f + 0.5f * sin(TWO_PI * flPh).toFloat()
+                        val fOut = readFrac(fl, flW, (flBaseV + flDepthV * lfo) * SR / 1000f)
+                        fl[flW] = x + fOut * flFbV
+                        flW = (flW + 1) % fl.size
+                        x += fOut * flMixV
+                    }
+
+                    // delay (от 1 мс: комб-фильтр, металл)
+                    dCur += (dTarget - dCur) * 0.002f
+                    val dOut = readFrac(dl, dw, dCur)
+                    dLp += dTone * (dOut - dLp)
+                    dl[dw] = x + softClip(dLp * dFbV)
+                    dw = (dw + 1) % dl.size
+                    x += dOut * dMix
+
+                    // reverb
                     val rin = x * 0.05f
                     var rs = 0f
                     for (cb in combs) rs += cb.process(rin, rFb, rDamp)
                     for (ap in aps) rs = ap.process(rs)
                     x += rs * rMix * 3f
 
-                    val yOut = (x * mst).coerceIn(-1f, 1f)
+                    val yOut = limit(x * mst).coerceIn(-1f, 1f)
                     buf[i] = (yOut * 32767f).toInt().toShort()
                 }
                 at.write(buf, 0, frames)
+
+                if (recording) {
+                    val bb = ByteArray(frames * 2)
+                    for (i in 0 until frames) {
+                        val v = buf[i].toInt()
+                        bb[2 * i] = v.toByte()
+                        bb[2 * i + 1] = (v shr 8).toByte()
+                    }
+                    recQueue.offer(bb)
+                    recSamples += frames
+                }
             }
             at.stop()
             at.release()
