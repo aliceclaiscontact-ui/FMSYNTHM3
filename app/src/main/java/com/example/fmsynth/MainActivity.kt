@@ -11,6 +11,7 @@ import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -20,9 +21,11 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
@@ -32,6 +35,7 @@ import java.util.Date
 import java.util.Locale
 import kotlin.math.ln
 import kotlin.math.pow
+import kotlin.math.roundToInt
 import kotlin.random.Random
 
 val NOTE_NAMES = arrayOf("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
@@ -98,6 +102,7 @@ class MainActivity : ComponentActivity() {
         themeState.intValue = prefs.getInt("theme", 0)
         orientState.intValue = prefs.getInt("orient", 0)
         applyOrientation(orientState.intValue)
+        Store.read(this, "auto")?.let { Store.engineFromJson(engine, it) }
         engine.start()
         var recFile: File? = null
         setContent {
@@ -155,6 +160,11 @@ class MainActivity : ComponentActivity() {
         }.start()
     }
 
+    override fun onPause() {
+        Store.write(this, "auto", Store.engineToJson(engine))
+        super.onPause()
+    }
+
     override fun onDestroy() {
         if (engine.recording) engine.stopRecording()
         engine.stop()
@@ -176,8 +186,11 @@ fun SynthApp(
     var page by remember { mutableIntStateOf(0) }
     var tab by remember { mutableIntStateOf(0) }
     var settings by remember { mutableStateOf(false) }
+    var projVer by remember { mutableIntStateOf(0) }
     val wide = LocalConfiguration.current.screenWidthDp >= 600
-    val pages = listOf("Паттерн" to "▦", "Звук" to "◉", "Эффекты" to "✦", "Микшер" to "≡")
+    val pages = listOf(
+        "Паттерн" to "▦", "Звук" to "◉", "Эффекты" to "✦", "Микшер" to "≡", "Файлы" to "▤"
+    )
 
     BackHandler(enabled = settings) { settings = false }
 
@@ -200,7 +213,7 @@ fun SynthApp(
                             selected = page == i,
                             onClick = { page = i },
                             icon = { Text(p.second, fontSize = 20.sp) },
-                            label = { Text(p.first) }
+                            label = { Text(p.first, fontSize = 11.sp) }
                         )
                     }
                 }
@@ -218,7 +231,7 @@ fun SynthApp(
                     }
                 }
                 Column(Modifier.weight(1f).fillMaxHeight()) {
-                    Transport(engine, wide, onRec) { settings = true }
+                    Transport(engine, wide, projVer, onRec) { settings = true }
                     if (page != 3) {
                         Row(
                             Modifier.fillMaxWidth().padding(horizontal = 12.dp),
@@ -248,7 +261,8 @@ fun SynthApp(
                             0 -> SeqPage(engine, tab, wide)
                             1 -> FmPage(engine, tab, wide)
                             2 -> FxPage(engine, tab, wide)
-                            else -> MixerPage(engine)
+                            3 -> MixerPage(engine, wide)
+                            else -> FilesPage(engine, tab) { projVer++ }
                         }
                     }
                 }
@@ -258,9 +272,15 @@ fun SynthApp(
 }
 
 @Composable
-fun Transport(engine: FmEngine, wide: Boolean, onRec: (Boolean) -> Unit, onSettings: () -> Unit) {
+fun Transport(
+    engine: FmEngine,
+    wide: Boolean,
+    projVer: Int,
+    onRec: (Boolean) -> Unit,
+    onSettings: () -> Unit
+) {
     var playing by remember { mutableStateOf(engine.playing) }
-    var bpm by remember { mutableFloatStateOf(engine.bpm) }
+    var bpm by remember(projVer) { mutableFloatStateOf(engine.bpm) }
     var rec by remember { mutableStateOf(engine.recording) }
     var sec by remember { mutableIntStateOf(0) }
     LaunchedEffect(rec) {
@@ -429,6 +449,19 @@ fun Param(
     }
 }
 
+// параметр дорожки по индексу
+@Composable
+fun TP(
+    label: String,
+    t: FmTrack,
+    idx: Int,
+    range: ClosedFloatingPointRange<Float>,
+    key: Any = t,
+    log: Boolean = false
+) {
+    Param(label, key, { t.p[idx] }, { t.p[idx] = it }, range, log)
+}
+
 @Composable
 fun FxCard(title: String, hint: String = "", content: @Composable ColumnScope.() -> Unit) {
     Card(Modifier.fillMaxWidth()) {
@@ -467,6 +500,8 @@ fun Cards(wide: Boolean, items: List<@Composable () -> Unit>) {
 fun RowScope.StepCell(
     s: Int,
     note: Int,
+    locked: Boolean,
+    inRange: Boolean,
     selected: Boolean,
     playhead: Boolean,
     onClick: () -> Unit
@@ -487,13 +522,42 @@ fun RowScope.StepCell(
         Modifier
             .weight(1f)
             .aspectRatio(0.8f)
+            .alpha(if (inRange) 1f else 0.35f)
             .clip(shape)
             .background(bg)
             .then(if (selected) Modifier.border(2.dp, cs.primary, shape) else Modifier)
             .clickable(onClick = onClick),
         contentAlignment = Alignment.Center
     ) {
-        Text(if (note >= 0) noteName(note) else "${s + 1}", color = fg, fontSize = 12.sp)
+        Text(
+            (if (note >= 0) noteName(note) else "${s + 1}") + (if (locked) "•" else ""),
+            color = fg,
+            fontSize = 12.sp
+        )
+    }
+}
+
+@Composable
+fun LockRow(
+    t: FmTrack,
+    sel: Int,
+    k: Int,
+    label: String,
+    range: ClosedFloatingPointRange<Float>
+) {
+    var on by remember(t, sel) { mutableStateOf(t.locks[k][sel] != LOCK_OFF) }
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        Switch(
+            checked = on,
+            onCheckedChange = {
+                on = it
+                t.locks[k][sel] = if (it) t.p[LOCK_BASE[k]] else LOCK_OFF
+            }
+        )
+        Text(label, style = MaterialTheme.typography.bodyMedium)
+    }
+    if (on) {
+        Param(label, Triple(t, sel, k), { t.locks[k][sel] }, { t.locks[k][sel] = it }, range)
     }
 }
 
@@ -506,9 +570,10 @@ fun SeqPage(engine: FmEngine, ti: Int, wide: Boolean) {
     var head by remember { mutableIntStateOf(-1) }
     var solo by remember(ti) { mutableStateOf(t.solo) }
     var mute by remember(ti) { mutableStateOf(t.mute) }
-    LaunchedEffect(Unit) {
+    var len by remember(ti) { mutableIntStateOf(t.len) }
+    LaunchedEffect(ti) {
         while (true) {
-            head = engine.step
+            head = t.pos
             delay(30)
         }
     }
@@ -522,11 +587,20 @@ fun SeqPage(engine: FmEngine, ti: Int, wide: Boolean) {
             FilterChip(selected = solo, onClick = { solo = !solo; t.solo = solo }, label = { Text("Solo") })
             FilterChip(selected = mute, onClick = { mute = !mute; t.mute = mute }, label = { Text("Mute") })
         }
+        Text("Длина паттерна: $len шагов", style = MaterialTheme.typography.labelLarge)
+        Slider(
+            value = len.toFloat(),
+            onValueChange = { len = it.roundToInt().coerceIn(1, STEPS); t.len = len },
+            valueRange = 1f..16f,
+            steps = 14
+        )
         for (row in 0 until STEPS / perRow) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 for (c in 0 until perRow) {
                     val s = row * perRow + c
-                    StepCell(s, t.notes[s], sel == s, head == s) {
+                    StepCell(
+                        s, t.notes[s], t.locks.any { it[s] != LOCK_OFF }, s < len, sel == s, head == s
+                    ) {
                         sel = s
                         val n = t.notes[s]
                         if (n >= 0) t.pending = n
@@ -545,7 +619,7 @@ fun SeqPage(engine: FmEngine, ti: Int, wide: Boolean) {
             OutlinedButton(onClick = { if (octave < 7) octave++ }) { Text("Окт +") }
         }
         Text(
-            "Выбери шаг и нажми ноту: она запишется, выбор сдвинется дальше",
+            "Выбери шаг и нажми ноту: она запишется, выбор сдвинется дальше. Точка у шага = есть P-lock",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -588,6 +662,24 @@ fun SeqPage(engine: FmEngine, ti: Int, wide: Boolean) {
                 modifier = Modifier.weight(1f)
             ) { Text("Случайно") }
         }
+        Cards(wide, listOf<@Composable () -> Unit>(
+            {
+                FxCard("Шаг ${sel + 1}", "Длина 16 = звук не обрезается") {
+                    val key = Triple(t, sel, ver)
+                    Param("Громкость шага", key, { t.vel[sel] }, { t.vel[sel] = it }, 0f..1f)
+                    Param("Длина (шагов)", key, { t.gate[sel] }, { t.gate[sel] = it }, 0.25f..16f, log = true)
+                    Param("Вероятность", key, { t.prob[sel] }, { t.prob[sel] = it }, 0f..1f)
+                }
+            },
+            {
+                FxCard("P-lock шага ${sel + 1}", "Свои значения параметров только на этом шаге") {
+                    LockRow(t, sel, 0, "FM-глубина", 0f..2f)
+                    LockRow(t, sel, 1, "Фильтр", 0f..1f)
+                    LockRow(t, sel, 2, "Затухание (с)", 0.03f..2f)
+                    LockRow(t, sel, 3, "Панорама", -1f..1f)
+                }
+            }
+        ))
     }
 }
 
@@ -596,20 +688,22 @@ fun SeqPage(engine: FmEngine, ti: Int, wide: Boolean) {
 @Composable
 fun FmPage(engine: FmEngine, ti: Int, wide: Boolean) {
     val t = engine.tracks[ti]
-    var algo by remember(ti) { mutableIntStateOf(t.algo) }
+    var algo by remember(ti) { mutableIntStateOf(t.p[P.ALGO].toInt()) }
+    var dest by remember(ti) { mutableIntStateOf(t.p[P.LFODEST].toInt()) }
     val descs = listOf(
         "4 → 3 → 2 → 1: длинная цепочка, самый яркий и жёсткий звук",
         "(4 → 3) + (2 → 1): две пары, колокольные тембры",
         "4 модулирует 1, 2 и 3: богатый хриплый тембр",
         "1 + 2 + 3 + 4: сумма синусов, органный звук"
     )
+    val dests = listOf("Выкл", "Питч", "FM", "Фильтр", "Громк.", "Пан")
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         FxCard("Алгоритм", "Как операторы влияют друг на друга") {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 for (i in 0..3) {
                     FilterChip(
                         selected = algo == i,
-                        onClick = { algo = i; t.algo = i },
+                        onClick = { algo = i; t.p[P.ALGO] = i.toFloat() },
                         label = { Text("A${i + 1}") }
                     )
                 }
@@ -620,74 +714,105 @@ fun FmPage(engine: FmEngine, ti: Int, wide: Boolean) {
             for (i in 0..3) {
                 add {
                     FxCard("Оператор ${i + 1}", "Ratio: множитель частоты. Level: громкость или сила модуляции") {
-                        Param("Ratio", ti, { t.ratio[i] }, { t.ratio[i] = it }, 0.25f..12f)
-                        Param("Level", ti, { t.level[i] }, { t.level[i] = it }, 0f..1f)
+                        TP("Ratio", t, P.R1 + i, 0.25f..12f)
+                        TP("Level", t, P.L1 + i, 0f..1f)
                     }
                 }
             }
+            add {
+                FxCard("Огибающие", "Как быстро звук и его яркость затухают") {
+                    TP("FM-глубина (общая)", t, P.FMAMT, 0f..2f)
+                    TP("Обратная связь Op4", t, P.FB, 0f..1f)
+                    TP("Затухание громкости (с)", t, P.AMPDEC, 0.03f..2f)
+                    TP("Затухание яркости (с)", t, P.MODDEC, 0.03f..2f)
+                }
+            }
+            add {
+                FxCard("LFO", "Медленная модуляция выбранного параметра") {
+                    Row(
+                        Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        dests.forEachIndexed { i, n ->
+                            FilterChip(
+                                selected = dest == i,
+                                onClick = { dest = i; t.p[P.LFODEST] = i.toFloat() },
+                                label = { Text(n) }
+                            )
+                        }
+                    }
+                    TP("Скорость (Гц)", t, P.LFORATE, 0.05f..20f, log = true)
+                    TP("Глубина", t, P.LFODEPTH, 0f..1f)
+                }
+            }
         })
-        FxCard("Огибающие", "Как быстро звук и его яркость затухают") {
-            Param("Обратная связь Op4", ti, { t.fb }, { t.fb = it }, 0f..1f)
-            Param("Затухание громкости (с)", ti, { t.ampDec }, { t.ampDec = it }, 0.03f..2f)
-            Param("Затухание яркости (с)", ti, { t.modDec }, { t.modDec = it }, 0.03f..2f)
-        }
     }
 }
 
-// ---------- Эффекты ----------
+// ---------- Эффекты дорожки ----------
 
 @Composable
 fun FxPage(engine: FmEngine, ti: Int, wide: Boolean) {
     val t = engine.tracks[ti]
-    val e = engine
+    var ver by remember { mutableIntStateOf(0) }
+    val key = Pair(t, ver)
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "Эффекты дорожки ${ti + 1}",
+                style = MaterialTheme.typography.titleLarge,
+                modifier = Modifier.weight(1f)
+            )
+            OutlinedButton(onClick = {
+                for (i in intArrayOf(P.RM_MIX, P.CR_MIX, P.FL_MIX, P.DL_MIX, P.RV_MIX, P.DRIVE)) t.p[i] = 0f
+                t.p[P.CUT] = 1f
+                t.p[P.RES] = 0f
+                ver++
+            }) { Text("Выключить все") }
+        }
         Cards(wide, listOf<@Composable () -> Unit>(
             {
-                FxCard("Дорожка ${ti + 1}: тон", "Фильтр и перегруз только для этой дорожки") {
-                    Param("Фильтр", ti, { t.cutoff }, { t.cutoff = it }, 0f..1f)
-                    Param("Драйв", ti, { t.drive }, { t.drive = it }, 0f..1f)
+                FxCard("Фильтр и драйв", "Низкочастотный фильтр с резонансом и перегруз") {
+                    TP("Фильтр", t, P.CUT, 0f..1f, key)
+                    TP("Резонанс", t, P.RES, 0f..1f, key)
+                    TP("Драйв", t, P.DRIVE, 0f..1f, key)
                 }
             },
             {
                 FxCard("Дилей", "Время меньше 15 мс и повторы 80%+ дают металлический звон") {
-                    Param("Время (мс)", "g", { e.delayMs }, { e.delayMs = it }, 1f..900f, log = true)
-                    Param("Повторы", "g", { e.delayFb }, { e.delayFb = it }, 0f..0.95f)
-                    Param("Тон повторов", "g", { e.delayTone }, { e.delayTone = it }, 0f..1f)
-                    Param("Микс", "g", { e.delayMix }, { e.delayMix = it }, 0f..1f)
+                    TP("Время (мс)", t, P.DL_TIME, 1f..900f, key, log = true)
+                    TP("Повторы", t, P.DL_FB, 0f..0.95f, key)
+                    TP("Тон повторов", t, P.DL_TONE, 0f..1f, key)
+                    TP("Микс", t, P.DL_MIX, 0f..1f, key)
                 }
             },
             {
                 FxCard("Флэнджер / хорус", "Мало задержки: реактивный свист. Много: широкий хорус") {
-                    Param("Скорость (Гц)", "g", { e.flRate }, { e.flRate = it }, 0.05f..5f, log = true)
-                    Param("Глубина (мс)", "g", { e.flDepth }, { e.flDepth = it }, 0f..15f)
-                    Param("Задержка (мс)", "g", { e.flBase }, { e.flBase = it }, 1f..25f)
-                    Param("Обратная связь", "g", { e.flFb }, { e.flFb = it }, 0f..0.9f)
-                    Param("Микс", "g", { e.flMix }, { e.flMix = it }, 0f..1f)
+                    TP("Скорость (Гц)", t, P.FL_RATE, 0.05f..5f, key, log = true)
+                    TP("Глубина (мс)", t, P.FL_DEPTH, 0f..15f, key)
+                    TP("Задержка (мс)", t, P.FL_BASE, 1f..25f, key)
+                    TP("Обратная связь", t, P.FL_FB, 0f..0.9f, key)
+                    TP("Микс", t, P.FL_MIX, 0f..1f, key)
                 }
             },
             {
                 FxCard("Биткрашер", "Грязный цифровой звук в стиле 8 бит") {
-                    Param("Разрядность (бит)", "g", { e.crBits }, { e.crBits = it }, 2f..16f)
-                    Param("Понижение частоты", "g", { e.crRate }, { e.crRate = it }, 1f..40f, log = true)
-                    Param("Микс", "g", { e.crMix }, { e.crMix = it }, 0f..1f)
+                    TP("Разрядность (бит)", t, P.CR_BITS, 2f..16f, key)
+                    TP("Понижение частоты", t, P.CR_RATE, 1f..40f, key, log = true)
+                    TP("Микс", t, P.CR_MIX, 0f..1f, key)
                 }
             },
             {
                 FxCard("Кольцевой модулятор", "Металлические, роботизированные тембры") {
-                    Param("Частота (Гц)", "g", { e.rmFreq }, { e.rmFreq = it }, 20f..2000f, log = true)
-                    Param("Микс", "g", { e.rmMix }, { e.rmMix = it }, 0f..1f)
+                    TP("Частота (Гц)", t, P.RM_FREQ, 20f..2000f, key, log = true)
+                    TP("Микс", t, P.RM_MIX, 0f..1f, key)
                 }
             },
             {
                 FxCard("Реверб") {
-                    Param("Размер", "g", { e.revSize }, { e.revSize = it }, 0f..1f)
-                    Param("Демпфирование", "g", { e.revDamp }, { e.revDamp = it }, 0f..0.9f)
-                    Param("Микс", "g", { e.revMix }, { e.revMix = it }, 0f..1f)
-                }
-            },
-            {
-                FxCard("Общая громкость") {
-                    Param("Master", "g", { e.master }, { e.master = it }, 0f..1f)
+                    TP("Размер", t, P.RV_SIZE, 0f..1f, key)
+                    TP("Демпфирование", t, P.RV_DAMP, 0f..0.9f, key)
+                    TP("Микс", t, P.RV_MIX, 0f..1f, key)
                 }
             }
         ))
@@ -697,31 +822,110 @@ fun FxPage(engine: FmEngine, ti: Int, wide: Boolean) {
 // ---------- Микшер ----------
 
 @Composable
-fun MixerPage(engine: FmEngine) {
-    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        for (i in 0 until NTRACKS) MixerRow(engine.tracks[i], i)
+fun MixerRow(t: FmTrack, i: Int) {
+    var mute by remember { mutableStateOf(t.mute) }
+    var solo by remember { mutableStateOf(t.solo) }
+    FxCard("Дорожка ${i + 1}") {
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            FilterChip(selected = solo, onClick = { solo = !solo; t.solo = solo }, label = { Text("Solo") })
+            FilterChip(selected = mute, onClick = { mute = !mute; t.mute = mute }, label = { Text("Mute") })
+        }
+        TP("Громкость", t, P.VOL, 0f..1f)
+        TP("Панорама (−1 лево, 1 право)", t, P.PAN, -1f..1f)
     }
 }
 
 @Composable
-fun MixerRow(t: FmTrack, i: Int) {
-    var mute by remember { mutableStateOf(t.mute) }
-    var solo by remember { mutableStateOf(t.solo) }
-    var vol by remember { mutableFloatStateOf(t.vol) }
-    Card(Modifier.fillMaxWidth()) {
-        Row(
-            Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            Text("T${i + 1}", style = MaterialTheme.typography.titleMedium)
-            FilterChip(selected = solo, onClick = { solo = !solo; t.solo = solo }, label = { Text("Solo") })
-            FilterChip(selected = mute, onClick = { mute = !mute; t.mute = mute }, label = { Text("Mute") })
-            Slider(
-                value = vol,
-                onValueChange = { vol = it; t.vol = it },
-                modifier = Modifier.weight(1f)
+fun MixerPage(engine: FmEngine, wide: Boolean) {
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Cards(wide, buildList<@Composable () -> Unit> {
+            for (i in 0 until NTRACKS) add { MixerRow(engine.tracks[i], i) }
+            add {
+                FxCard("Общее", "Swing сдвигает каждый второй шаг, как в драм-машинах") {
+                    Param("Master", "m", { engine.master }, { engine.master = it }, 0f..1f)
+                    Param("Swing", "s", { engine.swing }, { engine.swing = it }, 0f..0.5f)
+                }
+            }
+        })
+    }
+}
+
+// ---------- Файлы ----------
+
+@Composable
+fun SlotRow(name: String, stamp: String?, onSave: () -> Unit, onLoad: () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(name, style = MaterialTheme.typography.titleSmall)
+            Text(
+                stamp ?: "пусто",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+        }
+        FilledTonalButton(onClick = onSave) { Text("Сохранить") }
+        OutlinedButton(onClick = onLoad, enabled = stamp != null) { Text("Загрузить") }
+    }
+}
+
+@Composable
+fun FilesPage(engine: FmEngine, ti: Int, onLoaded: () -> Unit) {
+    val ctx = LocalContext.current
+    var ver by remember { mutableIntStateOf(0) }
+    val t = engine.tracks[ti]
+    fun toast(s: String) = Toast.makeText(ctx, s, Toast.LENGTH_SHORT).show()
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        FxCard("Проекты", "Всё сразу: паттерны, звуки, эффекты и темп всех дорожек. Последнее состояние сохраняется само") {
+            val tag = ver
+            for (n in 1..8) {
+                SlotRow(
+                    "Проект $n",
+                    Store.stamp(ctx, "proj_$n", tag),
+                    onSave = {
+                        Store.write(ctx, "proj_$n", Store.engineToJson(engine))
+                        ver++
+                        toast("Проект $n сохранён")
+                    },
+                    onLoad = {
+                        val o = Store.read(ctx, "proj_$n")
+                        if (o != null) {
+                            Store.engineFromJson(engine, o)
+                            onLoaded()
+                            ver++
+                            toast("Проект $n загружен")
+                        }
+                    }
+                )
+            }
+        }
+        FxCard(
+            "Звуки: дорожка ${ti + 1}",
+            "Сохраняет только звук и эффекты выбранной дорожки, без нот. Загрузить можно на любую дорожку"
+        ) {
+            val tag = ver
+            for (n in 1..8) {
+                SlotRow(
+                    "Звук $n",
+                    Store.stamp(ctx, "preset_$n", tag),
+                    onSave = {
+                        Store.write(ctx, "preset_$n", Store.trackToJson(t, false))
+                        ver++
+                        toast("Звук $n сохранён")
+                    },
+                    onLoad = {
+                        val o = Store.read(ctx, "preset_$n")
+                        if (o != null) {
+                            Store.trackFromJson(t, o, false)
+                            ver++
+                            toast("Звук $n загружен на дорожку ${ti + 1}")
+                        }
+                    }
+                )
+            }
         }
     }
 }

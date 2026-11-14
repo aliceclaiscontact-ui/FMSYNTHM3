@@ -30,7 +30,7 @@ object WavSaver {
     }
 
     private fun write(out: OutputStream, pcm: File) {
-        out.write(header(pcm.length(), 44100, 1, 16))
+        out.write(header(pcm.length(), 44100, 2, 16))
         pcm.inputStream().use { it.copyTo(out) }
     }
 
